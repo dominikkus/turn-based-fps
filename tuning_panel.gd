@@ -1,35 +1,43 @@
 extends PanelContainer
 
 signal create_requested(width: int, depth: int, cell_scale: float, enemy_count: int, stories: int,
-		firing_windows: bool)
+		player_free_move: bool, enemy_free_move: bool)
+
+enum Section { ARENA, PLAYER, ENEMIES, PISTOL, AR }
+
+const SECTION_NAMES := ["Arena", "Player", "Enemies", "Pistol", "AR"]
+const SECTION_ACCENTS := [
+	Color("8bd0c6"), Color("8cc7ec"), Color("eea993"), Color("e7c889"), Color("b8b8ef"),
+]
 
 # Vector2i grid dimensions use signed 32-bit coordinates.
 const MAX_WHOLE_NUMBER: int = 2147483647
 const TEXT_COLOR := Color("ecf2f7")
 const MUTED_COLOR := Color("afc2d2")
 const ERROR_COLOR := Color("ffac9f")
+const INPUT_BACKGROUND := Color("223543")
+const INPUT_BORDER := Color("3b5568")
 
 var _width_field: LineEdit
 var _depth_field: LineEdit
 var _stories_field: LineEdit
 var _scale_field: LineEdit
 var _enemies_field: LineEdit
-var _firing_windows: CheckButton
-var _field_scroll: ScrollContainer
-var _balance_title: Label
-var _balance_grid: GridContainer
+var _player_movement: OptionButton
+var _enemy_movement: OptionButton
+var _tabs: Array[Button] = []
+var _scrolls: Array[ScrollContainer] = []
+var _level_grids: Array[GridContainer] = []
+var _balance_grids: Array[GridContainer] = []
 var _balance_inputs: Array[Dictionary] = []
+var _page_style: StyleBoxFlat
 var _submit_button: Button
 var _status_label: Label
 
 
 func _init() -> void:
-	var background := StyleBoxFlat.new()
-	background.bg_color = Color("182431")
-	background.border_color = Color("385267")
-	background.set_border_width_all(1)
-	background.set_corner_radius_all(12)
-	add_theme_stylebox_override("panel", background)
+	custom_minimum_size.x = 472.0
+	add_theme_stylebox_override("panel", _style(Color("182431"), Color("385267"), 12))
 
 	var margin := MarginContainer.new()
 	margin.add_theme_constant_override("margin_left", 20)
@@ -39,7 +47,7 @@ func _init() -> void:
 	add_child(margin)
 
 	var content := VBoxContainer.new()
-	content.add_theme_constant_override("separation", 12)
+	content.add_theme_constant_override("separation", 10)
 	margin.add_child(content)
 
 	var title := Label.new()
@@ -48,52 +56,32 @@ func _init() -> void:
 	title.add_theme_color_override("font_color", TEXT_COLOR)
 	content.add_child(title)
 
-	_firing_windows = CheckButton.new()
-	_firing_windows.text = "LMB starts firing"
-	_firing_windows.tooltip_text = (
-		"Hold RMB to start the AP bar and keep it running. Release RMB to let the current segment finish.\n"
-		+ "Enable this to let LMB start one AP segment too. LMB fires while the bar is running.\n"
-		+ "Create Next Level applies the setting."
-	)
-	content.add_child(_firing_windows)
-
-	_field_scroll = ScrollContainer.new()
-	_field_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	_field_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_RESERVE
-	_field_scroll.follow_focus = true
-	_field_scroll.custom_minimum_size = Vector2(324, 220)
-	_field_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	content.add_child(_field_scroll)
-
-	var field_groups := VBoxContainer.new()
-	field_groups.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	field_groups.add_theme_constant_override("separation", 12)
-	_field_scroll.add_child(field_groups)
-
-	var fields := _add_field_grid(field_groups)
-	_width_field = _add_field(fields, "Grid width", "Cells")
-	_depth_field = _add_field(fields, "Grid depth", "Cells")
-	_stories_field = _add_field(fields, "Stories", "Number of floors")
-	_scale_field = _add_field(fields, "Cell scale", "World units per cell")
-	_enemies_field = _add_field(fields, "Enemy count", "Enemies")
-
-	_balance_title = Label.new()
-	_balance_title.text = "Combat balance"
-	_balance_title.add_theme_font_size_override("font_size", 18)
-	_balance_title.add_theme_color_override("font_color", TEXT_COLOR)
-	_balance_title.hide()
-	field_groups.add_child(_balance_title)
-	_balance_grid = _add_field_grid(field_groups)
-	_balance_grid.hide()
+	_build_sections(content)
+	var arena := _level_grids[Section.ARENA]
+	_width_field = _add_field(arena, "Grid width", "Cells", Section.ARENA)
+	_depth_field = _add_field(arena, "Grid depth", "Cells", Section.ARENA)
+	_stories_field = _add_field(arena, "Stories", "Number of floors", Section.ARENA)
+	_scale_field = _add_field(arena, "Cell scale", "World units per cell", Section.ARENA)
+	_player_movement = _add_movement_choice(_level_grids[Section.PLAYER])
+	var enemies := _level_grids[Section.ENEMIES]
+	_enemies_field = _add_field(enemies, "Enemy count", "Enemies", Section.ENEMIES)
+	_enemy_movement = _add_movement_choice(enemies)
 
 	_submit_button = Button.new()
 	_submit_button.text = "Create Next Level"
-	_submit_button.custom_minimum_size.y = 36
+	_submit_button.custom_minimum_size.y = 42
+	_submit_button.add_theme_font_size_override("font_size", 16)
+	for state in ["font_color", "font_hover_color", "font_focus_color", "font_pressed_color"]:
+		_submit_button.add_theme_color_override(state, Color("102934"))
+	_submit_button.add_theme_stylebox_override("normal", _style(Color("86c8be"), Color("9fd8cf")))
+	_submit_button.add_theme_stylebox_override("hover", _style(Color("a0d9cf"), Color("c3e7e1")))
+	_submit_button.add_theme_stylebox_override("pressed", _style(Color("6eada4"), Color("86c8be")))
 	_submit_button.pressed.connect(_on_create_pressed)
 	content.add_child(_submit_button)
 
 	_status_label = Label.new()
 	_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_status_label.add_theme_font_size_override("font_size", 14)
 	content.add_child(_status_label)
 	set_status("Enter the values to generate a level.")
 
@@ -112,32 +100,34 @@ func set_status(message: String, is_error: bool = false) -> void:
 
 
 func set_level_fields(width: int, depth: int, cell_scale: float, enemy_count: int,
-		stories: int = 1, firing_windows: bool = false) -> void:
+		stories: int = 1, player_free_move: bool = false, enemy_free_move: bool = false) -> void:
 	_width_field.text = str(width)
 	_depth_field.text = str(depth)
 	_stories_field.text = str(stories)
 	_scale_field.text = str(cell_scale)
 	_enemies_field.text = str(enemy_count)
-	_firing_windows.button_pressed = firing_windows
+	_player_movement.select(1 if player_free_move else 0)
+	_enemy_movement.select(1 if enemy_free_move else 0)
 
 
 func set_balance_fields(fields: Array[Dictionary]) -> void:
-	for child in _balance_grid.get_children():
-		_balance_grid.remove_child(child)
-		child.queue_free()
+	for grid in _balance_grids:
+		for child in grid.get_children():
+			grid.remove_child(child)
+			child.queue_free()
+		grid.hide()
 	_balance_inputs.clear()
 
 	for field in fields:
-		var hint := "Number"
-		if field["is_integer"]:
-			hint = "Whole number"
-		var input := _add_field(_balance_grid, field["label"], hint)
+		var section := _field_section(field)
+		var grid := _balance_grids[section]
+		var hint := "Whole number" if field["is_integer"] else "Number"
+		var caption := _section_caption(field["label"], section)
+		var input := _add_field(grid, caption, hint, section)
 		if field.has("value"):
 			input.text = str(field["value"])
 		_balance_inputs.append({"field": field.duplicate(), "input": input})
-
-	_balance_title.visible = not fields.is_empty()
-	_balance_grid.visible = not fields.is_empty()
+		grid.show()
 
 
 func read_balance_values() -> Dictionary:
@@ -154,31 +144,159 @@ func read_balance_values() -> Dictionary:
 	return values
 
 
+func _build_sections(content: VBoxContainer) -> void:
+	var tab_row := HBoxContainer.new()
+	tab_row.add_theme_constant_override("separation", 5)
+	content.add_child(tab_row)
+
+	var section_panel := PanelContainer.new()
+	section_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_page_style = _style(Color("121e2a"), Color("426071"), 8)
+	_page_style.content_margin_left = 12.0
+	_page_style.content_margin_right = 12.0
+	_page_style.content_margin_top = 12.0
+	_page_style.content_margin_bottom = 12.0
+	section_panel.add_theme_stylebox_override("panel", _page_style)
+	content.add_child(section_panel)
+	var pages := Control.new()
+	pages.custom_minimum_size.y = 220.0
+	section_panel.add_child(pages)
+
+	var tab_group := ButtonGroup.new()
+	for section in range(SECTION_NAMES.size()):
+		var tab := _add_tab(tab_row, section, tab_group)
+		_tabs.append(tab)
+		var scroll := ScrollContainer.new()
+		scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+		scroll.follow_focus = true
+		pages.add_child(scroll)
+		scroll.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		_scrolls.append(scroll)
+		var groups := VBoxContainer.new()
+		groups.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		groups.add_theme_constant_override("separation", 7)
+		scroll.add_child(groups)
+		var level_grid := _add_field_grid(groups)
+		var balance_grid := _add_field_grid(groups)
+		level_grid.visible = section < Section.PISTOL
+		balance_grid.hide()
+		_level_grids.append(level_grid)
+		_balance_grids.append(balance_grid)
+	_select_section(Section.ARENA)
+
+
+func _add_tab(row: HBoxContainer, section: int, group: ButtonGroup) -> Button:
+	var accent: Color = SECTION_ACCENTS[section]
+	var tab := Button.new()
+	tab.text = SECTION_NAMES[section]
+	tab.toggle_mode = true
+	tab.button_group = group
+	tab.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tab.custom_minimum_size.y = 36.0
+	tab.add_theme_font_size_override("font_size", 14)
+	tab.add_theme_color_override("font_color", MUTED_COLOR)
+	for state in ["font_pressed_color", "font_hover_pressed_color"]:
+		tab.add_theme_color_override(state, accent)
+	tab.add_theme_stylebox_override("normal", _style(Color("1d2c3a"), Color("324858")))
+	tab.add_theme_stylebox_override("hover", _style(Color("263747"), accent.darkened(0.50)))
+	var selected := _style(Color("223543").lerp(accent, 0.14), accent.darkened(0.38))
+	selected.border_width_bottom = 2
+	tab.add_theme_stylebox_override("pressed", selected)
+	tab.add_theme_stylebox_override("hover_pressed", selected)
+	tab.pressed.connect(_select_section.bind(section))
+	row.add_child(tab)
+	return tab
+
+
+func _select_section(section: int) -> void:
+	for index in range(_scrolls.size()):
+		_scrolls[index].visible = index == section
+		_tabs[index].set_pressed_no_signal(index == section)
+	var accent: Color = SECTION_ACCENTS[section]
+	_page_style.border_color = accent.darkened(0.50)
+
+
+func _field_section(field: Dictionary) -> int:
+	var named := str(field.get("section", "")).to_lower()
+	for section in range(SECTION_NAMES.size()):
+		if named == SECTION_NAMES[section].to_lower():
+			return section
+	var key := str(field["key"])
+	if key == "pillar_tiles":
+		return Section.ARENA
+	if key.begins_with("enemy_"):
+		return Section.ENEMIES
+	if key.begins_with("pistol_"):
+		return Section.PISTOL
+	if key.begins_with("ar_"):
+		return Section.AR
+	return Section.PLAYER
+
+
+func _section_caption(caption: String, section: int) -> String:
+	var prefix := "Enemy " if section == Section.ENEMIES else str(SECTION_NAMES[section]) + " "
+	var trimmed := caption.trim_prefix(prefix)
+	return trimmed.left(1).to_upper() + trimmed.substr(1)
+
+
+func _style(background: Color, border: Color, radius: int = 6) -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	style.bg_color = background
+	style.border_color = border
+	style.set_border_width_all(1)
+	style.set_corner_radius_all(radius)
+	style.content_margin_left = 8.0
+	style.content_margin_right = 8.0
+	return style
+
+
 func _add_field_grid(container: VBoxContainer) -> GridContainer:
 	var grid := GridContainer.new()
 	grid.columns = 2
-	grid.add_theme_constant_override("h_separation", 16)
-	grid.add_theme_constant_override("v_separation", 8)
+	grid.add_theme_constant_override("h_separation", 14)
+	grid.add_theme_constant_override("v_separation", 7)
 	container.add_child(grid)
 	return grid
 
 
-func _add_field(grid: GridContainer, caption: String, hint: String) -> LineEdit:
+func _add_field_label(grid: GridContainer, caption: String) -> void:
 	var label := Label.new()
 	label.text = caption
-	label.custom_minimum_size.x = 132
+	label.custom_minimum_size.x = 218.0
 	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	label.add_theme_font_size_override("font_size", 15)
 	label.add_theme_color_override("font_color", TEXT_COLOR)
 	grid.add_child(label)
 
+
+func _add_field(grid: GridContainer, caption: String, hint: String, section: int) -> LineEdit:
+	_add_field_label(grid, caption)
 	var field := LineEdit.new()
 	field.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	field.custom_minimum_size.x = 156
+	field.custom_minimum_size = Vector2(120.0, 30.0)
+	field.alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	field.placeholder_text = hint
 	field.tooltip_text = caption
+	field.set_meta("section", section)
+	field.add_theme_font_size_override("font_size", 15)
+	field.add_theme_stylebox_override("normal", _style(INPUT_BACKGROUND, INPUT_BORDER))
 	grid.add_child(field)
 	return field
+
+
+func _add_movement_choice(grid: GridContainer) -> OptionButton:
+	_add_field_label(grid, "Movement")
+	var movement := OptionButton.new()
+	movement.add_item("Grid steps")
+	movement.add_item("Free movement")
+	movement.select(0)
+	movement.custom_minimum_size = Vector2(120.0, 34.0)
+	movement.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	movement.add_theme_font_size_override("font_size", 15)
+	grid.add_child(movement)
+	return movement
 
 
 func _on_create_pressed() -> void:
@@ -200,7 +318,8 @@ func _on_create_pressed() -> void:
 	var enemy_count: Variant = _read_numeric_value(_enemies_field, "Enemy count", true, 0, MAX_WHOLE_NUMBER)
 	if enemy_count == null:
 		return
-	create_requested.emit(width, depth, cell_scale, enemy_count, stories, _firing_windows.button_pressed)
+	create_requested.emit(width, depth, cell_scale, enemy_count, stories,
+			_player_movement.selected == 1, _enemy_movement.selected == 1)
 
 
 func _read_numeric_value(
@@ -251,6 +370,8 @@ func _parse_integer(text: String) -> Variant:
 func _show_field_error(field: LineEdit, message: String) -> void:
 	set_status(message, true)
 	if field.is_inside_tree():
+		var section: int = field.get_meta("section")
+		_select_section(section)
 		field.grab_focus()
-		_field_scroll.ensure_control_visible(field)
+		_scrolls[section].ensure_control_visible.call_deferred(field)
 		field.select_all()

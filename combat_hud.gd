@@ -43,6 +43,7 @@ class ActionMeter extends Control:
 var _combat_info: CenterContainer
 var _meter := ActionMeter.new()
 var _reticle_radius := 0.0
+var _aiming := false
 var _ap_text: Label
 var _hp_text: Label
 var _enemy_text: Label
@@ -78,7 +79,6 @@ func set_combat_state(current_ap: float, max_ap: int, focusing: bool, hp: int,
 	_meter.max_ap = max_ap
 	_meter.focusing = focusing
 	_meter.queue_redraw()
-	queue_redraw()
 	var action_label := label_on_active if focusing else "AP"
 	_ap_text.text = "%s  %s / %d" % [action_label, String.num(_meter.current_ap, 2), max_ap]
 	_ap_text.add_theme_color_override("font_color", ACCENT if focusing else INK)
@@ -103,7 +103,18 @@ func set_weapon_state(weapon: String, ammo: int, magazine_size: int, reserve: in
 
 
 func set_reticle_radius(radius_px: float) -> void:
-	_reticle_radius = maxf(radius_px, 0.0) if is_finite(radius_px) else 0.0
+	var radius := maxf(radius_px, 0.0) if is_finite(radius_px) else 0.0
+	if radius == _reticle_radius:
+		return
+	_reticle_radius = radius
+	if _aiming:
+		queue_redraw()
+
+
+func set_aiming(is_aiming: bool) -> void:
+	if _aiming == is_aiming:
+		return
+	_aiming = is_aiming
 	queue_redraw()
 
 
@@ -139,15 +150,15 @@ func _draw() -> void:
 	if _result.visible:
 		return
 	var center := size * 0.5
-	var mark := ACCENT if _meter.focusing else INK
 	var outline := Color(0.02, 0.05, 0.08, 0.9)
-	if _reticle_radius >= 2.0:
+	if _aiming and _reticle_radius >= 2.0:
 		var points := ceili(clampf(_reticle_radius * 1.5, 16.0, 160.0))
 		draw_arc(center, _reticle_radius, 0.0, TAU, points, outline, 3.0, true)
-		draw_arc(center, _reticle_radius, 0.0, TAU, points, mark, 1.25, true)
-	if _meter.focusing or _reticle_radius < 2.0:
-		draw_circle(center, 2.25, outline, true, -1.0, true)
-		draw_circle(center, 1.5, mark, true, -1.0, true)
+		draw_arc(center, _reticle_radius, 0.0, TAU, points, ACCENT, 1.25, true)
+		return
+	var dot := ACCENT if _aiming else INK
+	draw_circle(center, 2.0, outline, true, -1.0, true)
+	draw_circle(center, 1.25, dot, true, -1.0, true)
 
 
 func _build_combat_info() -> void:

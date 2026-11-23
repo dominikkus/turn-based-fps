@@ -1,10 +1,12 @@
 extends RefCounted
 
+const AP_TOLERANCE := 0.000000001
+
 var max_ap: int
 var usec_per_ap: float
-var _whole_ap: int
+var _available_ap := 0.0
+var _segment_ap := 0.0
 var _segment_ends_at := -1.0
-var _continuous := false
 
 
 func _init(action_points: int, seconds_per_ap: float) -> void:
@@ -15,73 +17,72 @@ func _init(action_points: int, seconds_per_ap: float) -> void:
 
 
 func refill() -> void:
-	_whole_ap = max_ap
+	_available_ap = float(max_ap)
+	_segment_ap = 0.0
 	_segment_ends_at = -1.0
-	_continuous = false
+
+
+func available() -> float:
+	return _available_ap
 
 
 func remaining(now_usec: int) -> float:
-	var segment_fraction := clampf((_segment_ends_at - float(now_usec)) / usec_per_ap, 0.0, 1.0)
-	return float(_whole_ap) + segment_fraction
+	var segment_fraction := clampf((_segment_ends_at - float(now_usec)) / usec_per_ap, 0.0, _segment_ap)
+	return _available_ap + segment_fraction
 
 
-func spend(cost: int, now_usec: int) -> bool:
-	assert(cost > 0)
+func spend(cost: float, now_usec: int) -> bool:
+	if not is_finite(cost) or cost < 0.0:
+		return false
+	if cost == 0.0:
+		return true
 	# An action at the boundary may close the segment before a new one is charged.
 	_settle(now_usec, false)
-	if _whole_ap < cost:
+	if _available_ap + cost * AP_TOLERANCE < cost:
 		return false
-	_whole_ap -= cost
+	_available_ap = maxf(0.0, _available_ap - cost)
 	return true
 
 
-func begin_segment(now_usec: int) -> bool:
+func start_focus(now_usec: int) -> bool:
 	update(now_usec)
-	if is_spending(now_usec):
+	if is_focusing(now_usec):
 		return true
-	if _whole_ap == 0:
+	if _available_ap <= 0.0:
 		return false
-	_whole_ap -= 1
-	_segment_ends_at = float(now_usec) + usec_per_ap
+	_reserve_segment(float(now_usec))
 	return true
 
 
-func begin_continuous(now_usec: int) -> bool:
-	if not begin_segment(now_usec):
-		return false
-	_continuous = true
-	return true
-
-
-func stop_continuous(now_usec: int) -> void:
+func stop_focus(now_usec: int) -> void:
 	_settle(now_usec, false)
-	_continuous = false
+	_segment_ap = 0.0
+	_segment_ends_at = -1.0
 
 
 func update(now_usec: int) -> void:
 	_settle(now_usec, true)
 
 
-func is_spending(now_usec: int) -> bool:
+func is_focusing(now_usec: int) -> bool:
 	return float(now_usec) < _segment_ends_at
-
-
-func is_continuous() -> bool:
-	return _continuous
-
-
-func close_segment(now_usec: int) -> void:
-	stop_continuous(now_usec)
-	_segment_ends_at = -1.0
 
 
 func _settle(now_usec: int, include_boundary: bool) -> void:
 	var now := float(now_usec)
-	while _continuous and (_segment_ends_at < now or (include_boundary and _segment_ends_at == now)):
-		if _whole_ap == 0:
-			_continuous = false
+	while _segment_ends_at >= 0.0 and (_segment_ends_at < now or (include_boundary and _segment_ends_at == now)):
+		if _available_ap <= 0.0:
+			_segment_ap = 0.0
 			_segment_ends_at = -1.0
 			return
-		_whole_ap -= 1
 		# Renew from the previous deadline so skipped frames do not stretch the clock.
-		_segment_ends_at += usec_per_ap
+		_reserve_segment(_segment_ends_at)
+
+
+func _reserve_segment(start_usec: float) -> void:
+	_segment_ap = minf(1.0, _available_ap)
+	_available_ap -= _segment_ap
+	var deadline := start_usec + _segment_ap * usec_per_ap
+	# Keep floating-point noise from delaying a deadline on an exact clock tick.
+	var nearest_tick := roundf(deadline)
+	_segment_ends_at = nearest_tick if absf(deadline - nearest_tick) < 0.000001 else deadline

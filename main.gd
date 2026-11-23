@@ -5,7 +5,9 @@ const ArenaView = preload("res://arena_view.gd")
 const AimSpread = preload("res://aim_spread.gd")
 const Balance = preload("res://balance.gd")
 const CombatHUD = preload("res://combat_hud.gd")
+const EnemyTurnMotion = preload("res://enemy_turn_motion.gd")
 const FocusBudget = preload("res://focus_budget.gd")
+const FreePlayerMovement = preload("res://free_player_movement.gd")
 const TileOutline = preload("res://tile_outline.gd")
 const TuningPanel = preload("res://tuning_panel.gd")
 const VerticalEnemyPlan = preload("res://vertical_enemy_plan.gd")
@@ -16,9 +18,13 @@ const WeaponView = preload("res://weapon_view.gd")
 
 const RIFLE := 1
 const STEP_COST := 1
+const STEP_DIRECTIONS := {KEY_W: Vector2.UP, KEY_S: Vector2.DOWN, KEY_A: Vector2.LEFT, KEY_D: Vector2.RIGHT}
+const ENEMY_PREVIEW_INTERVAL_USEC := 100_000
 const LOOK_SENSITIVITY := 0.0022
 const PITCH_LIMIT := PI * 0.49
-const CONTROLS := "WASD Step · %s · R Reload · Wheel Switch · Space End Turn · F1 Tuning"
+const AIM_FOV_CHANGE := 7.0
+const AIM_FOV_TRANSITION := 0.12
+const CONTROLS := "WASD %s · Hold RMB Aim · LMB Fire · R Reload · Wheel Switch · Space End Turn · F1 Tuning"
 
 @onready var arena: ArenaView = $Arena
 @onready var tile_outline: TileOutline = $TileOutline
@@ -49,7 +55,7 @@ var _body_radius := 0.0
 var _enemy_stats: Dictionary = {}
 var _spawn_rng := RandomNumberGenerator.new()
 var _combat_rng := RandomNumberGenerator.new()
-var _lmb_starts_firing := false
+var _rest_fov: float
 var _focus_button_down := false
 var _trigger_down := false
 var _tuning_open := true
@@ -60,9 +66,17 @@ var _step_origin := Vector3.ZERO
 var _step_targets: Array[Dictionary] = []
 var _end_turn_pending := false
 var _focus_after_step := false
+var _player_free_move := false
+var _enemy_free_move := false
+var _free_move_speed: float
+var _free_move_ap_per_meter: float
+var _enemy_preview_dirty := false
+var _next_enemy_preview := 0
+var _enemy_motion: EnemyTurnMotion
 
 
 func _ready() -> void:
+	_rest_fov = camera.fov
 	_spawn_rng.randomize()
 	_combat_rng.randomize()
 	hud = CombatHUD.new()
@@ -76,14 +90,15 @@ func _ready() -> void:
 	tuning_panel.size_flags_horizontal = Control.SIZE_SHRINK_END
 	tuning_panel.size_flags_vertical = Control.SIZE_FILL
 	layout.add_child(tuning_panel)
-	tuning_panel.set_level_fields(15, 15, 2.0, 3, 1, true)
+	tuning_panel.set_level_fields(15, 15, 2.0, 3)
 	tuning_panel.set_balance_fields(Balance.fields())
-	tuning_panel.set_status("Create Next Level applies the firing mode and generates the arena.")
+	tuning_panel.set_status("Create Next Level generates the arena with these settings.")
 	tuning_panel.create_requested.connect(_on_create_requested)
 
 
 func _on_create_requested(
-	width: int, depth: int, cell_scale: float, enemy_count: int, stories: int, firing_windows: bool
+	width: int, depth: int, cell_scale: float, enemy_count: int, stories: int,
+	player_free_move: bool, enemy_free_move: bool
 ) -> void:
 	var values := tuning_panel.read_balance_values()
 	if values.is_empty():
@@ -94,7 +109,8 @@ func _on_create_requested(
 		return
 	var draft := {
 		"width": width, "depth": depth, "cell_scale": cell_scale, "enemy_count": enemy_count,
-		"stories": stories, "balance": values, "firing_windows": firing_windows,
+		"stories": stories, "balance": values,
+		"player_free_move": player_free_move, "enemy_free_move": enemy_free_move,
 	}
 	message = _start_level(draft)
 	if not message.is_empty():
@@ -148,12 +164,16 @@ func _start_level(draft: Dictionary, keep_layout := false) -> String:
 	_vertical_layout = spawns if stories > 1 else {}
 	_player_surface = player_surface
 	_enemy_surfaces = enemy_surfaces
-	_lmb_starts_firing = draft.get("firing_windows", false)
+	_player_free_move = draft.get("player_free_move", false)
+	_enemy_free_move = draft.get("enemy_free_move", false)
+	_free_move_speed = values.get("free_move_speed", Balance.FREE_MOVE_SPEED)
+	_free_move_ap_per_meter = values.get("free_move_ap_per_meter", Balance.FREE_MOVE_AP_PER_METER)
+	_enemy_preview_dirty = false
+	_next_enemy_preview = 0
+	_enemy_motion = null
+	hud.set_controls(CONTROLS % ("Move" if _player_free_move else "Step"))
 	var ap_seconds: float = values.get("ap_seconds", values.get("firing_window_seconds", Balance.AP_SECONDS))
 	budget = FocusBudget.new(values["ap"], ap_seconds)
-	var fire_controls := "LMB Fire" if _lmb_starts_firing else "RMB Start · LMB Fire"
-	fire_controls += " · Hold RMB to keep spending AP"
-	hud.set_controls(CONTROLS % fire_controls)
 	weapons = WeaponLoadout.new(Balance.loadout(values))
 	weapon_view.set_cell_scale(cell_scale)
 	weapon_view.set_weapon(weapons.active_index)
@@ -185,6 +205,7 @@ func _start_level(draft: Dictionary, keep_layout := false) -> String:
 	_outline_surface(player_surface)
 	_update_camera_position()
 	camera.rotation = Vector3.ZERO
+	camera.fov = _rest_fov
 	var toward_center := -player_position
 	if toward_center.length_squared() > 0.0:
 		camera.rotation.y = atan2(-toward_center.x, -toward_center.z)
@@ -195,8 +216,7 @@ func _start_level(draft: Dictionary, keep_layout := false) -> String:
 	_trigger_down = false
 	_finished = false
 	hud.hide_result()
-	var start_buttons := "LMB or RMB" if _lmb_starts_firing else "RMB"
-	tuning_panel.set_status("%s starts the AP bar. Create Next Level applies edits." % start_buttons)
+	tuning_panel.set_status("Create Next Level applies these settings.")
 	_set_tuning(false)
 	hud.set_feedback("Turn 1")
 	_update_enemy_plans()
@@ -219,9 +239,8 @@ func _set_tuning(is_open: bool) -> void:
 	var capture := not is_open and not _finished
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if capture else Input.MOUSE_MODE_VISIBLE
 	if is_open:
-		_close_firing_segment(Time.get_ticks_usec())
-		_focus_button_down = false
-		_focus_after_step = false
+		_drop_aim(Time.get_ticks_usec())
+		camera.fov = _rest_fov
 
 
 func _input(event: InputEvent) -> void:
@@ -239,6 +258,8 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion:
 		camera.rotation.y -= event.relative.x * LOOK_SENSITIVITY
 		_adjust_pitch(-event.relative.y * LOOK_SENSITIVITY)
+	elif _enemy_motion != null:
+		return
 	elif event is InputEventMouseButton:
 		_handle_mouse_button(event, now)
 	elif event is InputEventKey and event.pressed and not event.echo:
@@ -251,9 +272,9 @@ func _handle_mouse_button(event: InputEventMouseButton, now: int) -> void:
 			_focus_button_down = event.pressed
 			if not event.pressed:
 				_focus_after_step = false
-				budget.stop_continuous(now)
+				budget.stop_focus(now)
 			elif _step_targets.is_empty():
-				_begin_continuous_firing(now)
+				_begin_focus(now)
 			elif not _end_turn_pending:
 				_focus_after_step = true
 		MOUSE_BUTTON_LEFT:
@@ -265,11 +286,11 @@ func _handle_mouse_button(event: InputEventMouseButton, now: int) -> void:
 				_switch_weapon(1 if event.button_index == MOUSE_BUTTON_WHEEL_UP else -1, now)
 
 
-func _begin_continuous_firing(now: int) -> void:
+func _begin_focus(now: int) -> void:
 	if not weapons.can_fire():
 		hud.set_feedback("Magazine empty · Release RMB to reload or switch")
-	elif not budget.begin_continuous(now):
-		hud.set_feedback("Firing needs 1 AP")
+	elif not budget.start_focus(now):
+		hud.set_feedback("Firing needs AP")
 	else:
 		hud.set_feedback("")
 
@@ -278,10 +299,9 @@ func _handle_key(key: Key, now: int) -> void:
 	if _end_turn_pending:
 		return
 	match key:
-		KEY_W: _try_step(Vector2.UP, now)
-		KEY_S: _try_step(Vector2.DOWN, now)
-		KEY_A: _try_step(Vector2.LEFT, now)
-		KEY_D: _try_step(Vector2.RIGHT, now)
+		KEY_W, KEY_S, KEY_A, KEY_D:
+			if not _player_free_move:
+				_try_step(STEP_DIRECTIONS[key], now)
 		KEY_R: _reload(now)
 		KEY_SPACE:
 			_focus_after_step = false
@@ -298,9 +318,17 @@ func _process(delta: float) -> void:
 		state.update(delta)
 	var now := Time.get_ticks_usec()
 	budget.update(now)
-	if _trigger_down and weapons.active_index == RIFLE:
+	_update_aim_zoom(delta)
+	if _enemy_motion != null:
+		_advance_enemy_turn(delta)
+		_update_hud(now)
+		return
+	if _focus_button_down and _trigger_down and weapons.active_index == RIFLE:
 		_try_fire(now)
-	_advance_steps(delta, now)
+	if _player_free_move:
+		_update_free_movement(delta, now)
+	else:
+		_advance_steps(delta, now)
 	_update_hud(now)
 
 
@@ -309,8 +337,54 @@ func _notification(what: int) -> void:
 		_set_tuning(true)
 
 
+func _update_free_movement(delta: float, now: int) -> void:
+	var direction := Vector2(
+		int(Input.is_physical_key_pressed(KEY_D)) - int(Input.is_physical_key_pressed(KEY_A)),
+		int(Input.is_physical_key_pressed(KEY_S)) - int(Input.is_physical_key_pressed(KEY_W))
+	)
+	var moved := _try_free_move(direction, delta, now)
+	if _enemy_preview_dirty and (not moved or now >= _next_enemy_preview):
+		_update_enemy_plans()
+		_next_enemy_preview = now + ENEMY_PREVIEW_INTERVAL_USEC
+
+
+func _try_free_move(direction: Vector2, delta: float, now: int) -> bool:
+	if _focus_button_down or direction.is_zero_approx():
+		return false
+	var distance := minf(_free_move_speed * delta, budget.available() / _free_move_ap_per_meter)
+	if distance <= 0.0:
+		hud.set_feedback("No AP to move")
+		return false
+
+	var forward := -camera.basis.z
+	forward.y = 0.0
+	forward = forward.normalized()
+	var right := forward.cross(Vector3.UP)
+	var offset := (right * direction.x - forward * direction.y).normalized() * distance
+	var motion := FreePlayerMovement.plan(
+		_space, player_position, _player_surface, offset, distance, _body_radius,
+		ArenaView.BODY_HEIGHT_CELLS * _cell_scale, _living_enemy_positions()
+	)
+	if motion.is_empty() or motion["distance"] <= 0.0:
+		return false
+	var price := minf(budget.available(), float(motion["distance"]) * _free_move_ap_per_meter)
+	if not budget.spend(price, now):
+		return false
+
+	player_position = motion["position"]
+	var new_surface: int = motion["surface"]
+	if new_surface != _player_surface:
+		_player_surface = new_surface
+		_next_enemy_preview = now
+	_outline_surface(_player_surface)
+	_update_camera_position()
+	_enemy_preview_dirty = true
+	hud.set_feedback("")
+	return true
+
+
 func _try_step(direction: Vector2, now: int) -> void:
-	if budget.is_continuous() or _focus_after_step:
+	if _focus_button_down:
 		hud.set_feedback("Release RMB to move")
 		return
 	var forward := -camera.basis.z
@@ -340,7 +414,7 @@ func _try_step(direction: Vector2, now: int) -> void:
 	if not budget.spend(STEP_COST, now):
 		hud.set_feedback("A step costs 1 AP")
 		return
-	_close_firing_segment(now)
+	_trigger_down = false
 	if _step_targets.is_empty():
 		_step_origin = player_position
 	step["position"] = destination
@@ -351,15 +425,20 @@ func _try_step(direction: Vector2, now: int) -> void:
 func _path_blocked_by_enemy(start: Vector3, waypoints: Array[Vector3]) -> bool:
 	var spacing := 2.0 * _body_radius - 0.000001 * _cell_scale
 	var height := ArenaView.BODY_HEIGHT_CELLS * _cell_scale
-	var actors: Array[Vector3] = []
-	for index in range(enemy_health.size()):
-		if enemy_health[index] > 0:
-			actors.append(arena.enemy_markers[index].position)
+	var actors := _living_enemy_positions()
 	for end in waypoints:
 		if VerticalSpace.crosses_actors(start, end, spacing, height, actors):
 			return true
 		start = end
 	return false
+
+
+func _living_enemy_positions() -> Array[Vector3]:
+	var actors: Array[Vector3] = []
+	for index in range(enemy_health.size()):
+		if enemy_health[index] > 0:
+			actors.append(arena.enemy_markers[index].position)
+	return actors
 
 
 func _advance_steps(delta: float, now: int) -> void:
@@ -382,7 +461,7 @@ func _advance_steps(delta: float, now: int) -> void:
 				_end_turn(now)
 			elif _focus_after_step:
 				_focus_after_step = false
-				_begin_continuous_firing(now)
+				_begin_focus(now)
 			return
 	var progress := smoothstep(0.0, 1.0, _step_elapsed / _step_seconds)
 	var current: Dictionary = _step_targets.front()
@@ -416,7 +495,7 @@ func _reload(now: int) -> void:
 	if not budget.spend(WeaponLoadout.RELOAD_COST, now):
 		hud.set_feedback("Reload costs 2 AP")
 		return
-	_close_firing_segment(now)
+	_trigger_down = false
 	weapons.reload()
 	hud.set_feedback("%s reloaded" % weapons.active_weapon()["name"])
 
@@ -430,18 +509,24 @@ func _switch_weapon(direction: int, now: int) -> void:
 	if not budget.spend(WeaponLoadout.SWITCH_COST, now):
 		hud.set_feedback("Switching costs 1 AP")
 		return
-	_close_firing_segment(now)
+	_trigger_down = false
 	weapons.switch(direction)
 	weapon_view.set_weapon(weapons.active_index)
 	hud.set_feedback("%s equipped" % weapons.active_weapon()["name"])
 
 
-func _close_firing_segment(now: int) -> void:
-	budget.close_segment(now)
+func _drop_aim(now: int) -> void:
+	budget.stop_focus(now)
+	_focus_button_down = false
+	_focus_after_step = false
 	_trigger_down = false
 
 
 func _try_fire(now: int, trigger_pressed := false) -> void:
+	if not _focus_button_down:
+		if trigger_pressed:
+			hud.set_feedback("Hold RMB to aim and fire")
+		return
 	if _end_turn_pending or not _step_targets.is_empty():
 		if trigger_pressed:
 			hud.set_feedback("Finish moving before firing")
@@ -450,19 +535,14 @@ func _try_fire(now: int, trigger_pressed := false) -> void:
 		_show_empty_magazine()
 		return
 	budget.update(now)
-	if not _lmb_starts_firing and not budget.is_spending(now):
+	if not budget.is_focusing(now):
 		if trigger_pressed:
-			hud.set_feedback("Hold RMB to start firing")
+			hud.set_feedback("Firing needs AP")
 		return
 	if not weapons.is_ready_to_fire(now):
 		if trigger_pressed:
 			hud.set_feedback("%s cycling" % weapons.active_weapon()["name"])
 		return
-	if not budget.begin_segment(now):
-		_trigger_down = false
-		hud.set_feedback("Firing needs 1 AP")
-		return
-
 	var aim := aim_states[weapons.active_index]
 	var direction := aim.spread_direction(camera.global_basis, _combat_rng)
 	var origin := camera.global_position
@@ -489,7 +569,7 @@ func _try_fire(now: int, trigger_pressed := false) -> void:
 		else:
 			hud.set_feedback("Pillar blocked the shot")
 	if not weapons.can_fire() and not _finished:
-		budget.stop_continuous(now)
+		budget.stop_focus(now)
 		_show_empty_magazine()
 
 
@@ -521,25 +601,27 @@ func _damage_enemy(index: int, damage: int) -> void:
 
 
 func _update_enemy_plans() -> void:
+	_enemy_preview_dirty = false
 	plans.clear()
 	var positions: Dictionary = {}
 	for index in range(enemy_health.size()):
 		if enemy_health[index] > 0:
 			positions[index] = arena.enemy_markers[index].position
-	# Forecast and execute in the same order so earlier movers block later ones.
+	# Reserve starts and earlier routes so enemies can walk together without trading places.
+	var reserved: Array[Vector3] = []
 	for index in positions:
-		var others: Array[Vector3] = []
+		var others := reserved.duplicate()
 		for other_index in positions:
 			if other_index != index:
 				others.append(positions[other_index])
 		var plan := VerticalEnemyPlan.plan(
 			positions[index], _enemy_surfaces[index], player_position, _player_surface, others,
-			_cell_scale, 2.0 * _body_radius, _enemy_stats, _space, _enemy_has_sight
+			_cell_scale, 2.0 * _body_radius, _enemy_stats, _space, _enemy_has_sight, _enemy_free_move
 		)
 		plans[index] = plan
 		var waypoints: Array[Vector3] = plan["waypoints"]
 		if not waypoints.is_empty():
-			positions[index] = waypoints.back()
+			reserved.append_array(EnemyTurnMotion.reserve_path(positions[index], waypoints, _body_radius * 0.5))
 		var label := arena.enemy_labels[index]
 		if plan["fires"]:
 			label.text = "◎ %s · %d dmg" % [_format_chance(plan["chance"]), plan["damage"]]
@@ -560,19 +642,41 @@ func _format_chance(chance: float) -> String:
 
 
 func _end_turn(now: int) -> void:
-	_close_firing_segment(now)
+	_drop_aim(now)
+	if _enemy_preview_dirty:
+		_update_enemy_plans()
+	var origins: Dictionary = {}
+	for index in plans:
+		origins[index] = arena.enemy_markers[index].position
+	var motion := EnemyTurnMotion.new(origins, plans, _cell_scale)
+	if motion.is_empty():
+		_resolve_enemy_attacks()
+		return
+	_enemy_motion = motion
+	hud.set_feedback("Enemy turn · Moving")
+
+
+func _advance_enemy_turn(delta: float) -> void:
+	var positions := _enemy_motion.advance(delta)
+	for index in positions:
+		arena.enemy_markers[index].position = positions[index]
+	if not _enemy_motion.finished():
+		return
+	for index in positions:
+		_enemy_surfaces[index] = plans[index]["surface"]
+		arena.enemy_bodies[index].force_update_transform()
+	_enemy_motion = null
+	_resolve_enemy_attacks()
+
+
+func _resolve_enemy_attacks() -> void:
 	var shots := 0
 	var damage_taken := 0
 	for index in plans:
 		var plan: Dictionary = plans[index]
-		var waypoints: Array[Vector3] = plan["waypoints"]
-		var actor := arena.enemy_markers[index]
-		if not waypoints.is_empty():
-			_enemy_surfaces[index] = plan["surface"]
-			actor.position = _space.surface_center(_enemy_surfaces[index])
-			arena.enemy_bodies[index].force_update_transform()
 		if not plan["fires"]:
 			continue
+		var actor := arena.enemy_markers[index]
 		shots += 1
 		var chance: float = plan["chance"]
 		var roll := _combat_rng.randf()
@@ -587,11 +691,11 @@ func _end_turn(now: int) -> void:
 			did_hit = false
 		if did_hit:
 			damage_taken += int(plan["damage"])
-			player_hp = maxi(0, player_hp - int(plan["damage"]))
 		arena.draw_tracer(shot_start, shot_end, Color("ff8969"), _cell_scale)
-		if player_hp == 0:
-			_show_result(false)
-			return
+	player_hp = maxi(0, player_hp - damage_taken)
+	if player_hp == 0:
+		_show_result(false)
+		return
 
 	round_number += 1
 	budget.refill()
@@ -601,7 +705,8 @@ func _end_turn(now: int) -> void:
 
 func _show_result(won: bool) -> void:
 	_finished = true
-	_close_firing_segment(Time.get_ticks_usec())
+	_drop_aim(Time.get_ticks_usec())
+	camera.fov = _rest_fov
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	var result := "Victory" if won else "Defeat"
 	hud.show_result(result, "Replay keeps the arena and rolls fresh spawns.")
@@ -630,11 +735,17 @@ func _adjust_pitch(amount: float) -> void:
 	camera.rotation.x = clampf(camera.rotation.x + amount, -PITCH_LIMIT, PITCH_LIMIT)
 
 
+func _update_aim_zoom(delta: float) -> void:
+	var target_fov := _rest_fov - AIM_FOV_CHANGE if _focus_button_down else _rest_fov
+	camera.fov = move_toward(camera.fov, target_fov, AIM_FOV_CHANGE * delta / AIM_FOV_TRANSITION)
+
+
 func _update_hud(now: int) -> void:
 	hud.set_combat_state(
-		budget.remaining(now), budget.max_ap, budget.is_spending(now),
-		player_hp, settings["balance"]["player_hp"], enemies_left, "Firing"
+		budget.remaining(now), budget.max_ap, budget.is_focusing(now),
+		player_hp, settings["balance"]["player_hp"], enemies_left
 	)
+	hud.set_aiming(_focus_button_down)
 	var story := _space.story(_player_surface) + 1
 	hud.set_story(story, settings.get("stories", 1))
 	var weapon := weapons.active_weapon()

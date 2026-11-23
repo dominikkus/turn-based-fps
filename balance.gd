@@ -2,6 +2,8 @@ extends RefCounted
 
 const WEAPON_NAMES := ["Pistol", "AR"]
 const AP_SECONDS := 0.35
+const FREE_MOVE_SPEED := 4.0
+const FREE_MOVE_AP_PER_METER := 1.0
 const PISTOL_FIRE_RATE := 5.0
 const AR_FIRE_RATE := 8.0
 
@@ -11,6 +13,8 @@ static func fields() -> Array[Dictionary]:
 		_field("pillar_tiles", "Pillar tiles", 30, 0),
 		_field("ap", "AP per turn", 5, 1, 100),
 		_field("step_seconds", "Seconds per movement step", 0.16, 0.04, 1.0),
+		_field("free_move_speed", "Free move speed (m/s)", FREE_MOVE_SPEED, 0.1, 25.0),
+		_field("free_move_ap_per_meter", "Free move AP per meter", FREE_MOVE_AP_PER_METER, 0.01, 50.0),
 		_field("ap_seconds", "Seconds per AP", AP_SECONDS, 0.001, 600.0),
 		_field("player_hp", "Player HP", 5, 1),
 		_field("enemy_hp", "Enemy HP", 2, 1),
